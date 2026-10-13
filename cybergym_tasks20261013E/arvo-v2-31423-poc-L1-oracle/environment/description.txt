@@ -1,0 +1,76 @@
+Component: PHP interpreter core (Zend Engine), array/hashtable subsystem.
+Fuzz target: php-fuzz-execute (AFL-based harness that parses and executes a
+PHP script buffer via the SAPI request path).
+
+Crash summary: AddressSanitizer reports a heap-use-after-free, 1-byte READ,
+while the interpreter is executing the "fetch next element" step of a
+by-reference foreach loop. The read happens inside the routine that
+computes an active foreach iterator's current bucket position from its
+tracked hashtable; the hashtable object that iterator refers to has
+already been freed by the time this read occurs.
+
+Allocation/free history from the report:
+- The freed 56-byte block was allocated while setting up the by-reference
+  foreach loop: the "reset" opcode handler for a by-reference foreach
+  duplicates the array being iterated (to give the loop a private copy to
+  walk) and registers a hashtable iterator against that duplicate so the
+  loop can resume correctly even if the array is mutated from inside the
+  loop body.
+- That same block was freed later in the same request, while executing an
+  assignment inside the loop body: the assignment's value-teardown path
+  drops the refcount of the previously-held array value to zero and tears
+  the hashtable down (releasing its owned memory) because the variable is
+  being overwritten with a new value.
+- The subsequent iteration step ("fetch" opcode handler for the same
+  by-reference foreach) then consults the loop's iterator to find the next
+  bucket to visit. It ends up reading through the iterator's stored
+  hashtable pointer, which still refers to the block that was just freed —
+  the 1-byte UAF read.
+
+Root-cause shape: a hashtable can have one or more foreach iterators
+registered against it (tracked in a process-global iterator table, keyed
+by the hashtable) so that by-reference loops keep working correctly across
+mutation. When a hashtable is torn down, every iterator still registered
+against it is supposed to be detached/invalidated as part of that
+teardown, specifically so a later "fetch next" on that now-stale loop
+either notices the array is gone or falls back to a safe state instead of
+dereferencing freed memory. The vulnerable teardown routine has (at least)
+two exit paths depending on the internal state of the hashtable being
+destroyed — one for a hashtable that still owns allocated bucket storage,
+and a fast-path/early-exit for a hashtable that has already become the
+degenerate "empty, no storage allocated" state. Only one of those paths
+performs the iterator-detach step; the other path frees/releases the
+hashtable without ever detaching the iterators still pointing at it. A
+hashtable can reach the "empty, no storage allocated" state at runtime
+when all of its elements are removed by an in-place array-mutating
+operation, so a by-reference foreach whose target array is emptied this
+way, and is then dropped to refcount zero while an active iterator is
+still registered on it, is destroyed via the exact path that skips
+detachment — leaving a dangling iterator entry that the next loop
+iteration will dereference into freed memory.
+
+Trigger shape needed by a PoC: a plain (non-object) array with at least one
+element, iterated with `foreach (... as &$var)` (by reference, so an
+iterator gets registered), where the loop body performs an in-place
+mutating operation on the same array that removes all remaining elements
+(driving it to the degenerate empty state) and, in the same step or a
+following step, drops the array's refcount to zero (e.g. by reassigning
+the variable that held it) so the hashtable is actually torn down while
+the loop is still active. The very next loop iteration then triggers the
+UAF read. A single AFL-style byte-string input reproduces this in one
+fuzzer_execute_ex run — no external input, files, or network are involved;
+the vulnerable state is reached purely through interpreter opcode
+execution order within one script.
+
+fix_commit plausibility: 2c508c4d407e98a27ed2631ae88e2e10ee430003 is
+directly on point. The diff reorders exactly the two exit paths of the
+hashtable-teardown routine described above so that the iterator-detach
+step now runs unconditionally on both paths (moved to execute right before
+the hashtable's own memory is released, after the shared exit label,
+instead of only on the "still has storage" path before it). The
+accompanying regression test constructs precisely the trigger shape
+above: a single-element array iterated by reference, whose body reassigns
+the loop variable to the result of an in-place operation that empties the
+array — matching the allocation/free/UAF call chain in this report
+function-for-function. This is a plausible, on-target fix, not a
+tangential one.

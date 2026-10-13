@@ -1,0 +1,93 @@
+Project: skia (Skia Shading Language / SkSL compiler)
+Fuzz target: sksl2pipeline (FuzzSKSL2Pipeline) — compiles an attacker-supplied
+SkSL shader source string.
+Sanitizer report (re-derived from error.txt): AddressSanitizer use-after-poison,
+READ of size 8, triggered while the SkSL optimizer runs its constant-propagation
+step over a shader's control-flow graph.
+
+Where it is stored/created (traced from the ASan back half)
+----------------------------------------------------------
+The faulting 8-byte region does not belong to a plain heap object. The
+"allocated by" stack shows the block coming from GrMemoryPool::Make ->
+SkSL::Pool::Create, i.e. it is one large arena (a single ~64 KiB region)
+that the SkSL compiler carves all of its IR nodes out of. The shadow bytes
+around the fault are all f7 ("poisoned by user"), not fd ("freed"): SkSL does
+not hand recycled IR memory back to the allocator, it *poisons* sub-ranges of
+its own pool when an IR node's storage is reclaimed. So "use-after-poison" here
+is the pool's equivalent of a use-after-free — a live pointer into arena memory
+that has already been retired and marked dead.
+
+Root cause
+----------
+During optimization the compiler keeps a "definition map" that answers, for a
+given variable, "what expression is this variable currently known to hold?"
+For each variable it caches a raw pointer to the unique_ptr<Expression> slot
+that lives *inside* another IR node (for example the value slot of a
+declaration or the right-hand side of an assignment). That slot's storage is
+itself owned by the pool.
+
+The vulnerable code, when it wants to fold a variable reference into its known
+constant value, fetches that cached slot pointer straight out of the map and
+dereferences it: it reaches through the stored pointer-to-slot to the
+unique_ptr and calls the unique_ptr's accessor to inspect the pointed-to
+expression (checking whether it is a compile-time constant before cloning it).
+The problem is a lifetime mismatch: the map records a slot pointer for *every*
+definition, including expressions that are not guaranteed to outlive the
+optimization pass. If the IR node that owns that unique_ptr slot is recycled /
+retired to the pool before the propagation step runs, its memory is poisoned,
+but the definition map still holds the now-dangling pointer to it. The fold
+step then dereferences that stale slot pointer, and the very read of the
+unique_ptr's internal pointer lands on poisoned arena bytes — hence the
+8-byte use-after-poison READ.
+
+Directionality (reviewed)
+-------------------------
+- Read, not write: ASan reports READ of size 8 — the 8 bytes being read are the
+  raw pointer member inside the unique_ptr as the accessor is invoked.
+- The failing pointer is the cached slot pointer held by the definition map,
+  which points into pooled IR-node memory that has since been poisoned. This is
+  a stale/dangling reference to reclaimed memory, NOT an out-of-bounds walk that
+  grew past a buffer end, and NOT a degenerate/under-range value slipping past a
+  bounds check. The address arithmetic is legitimate; the *lifetime* of the
+  target is not.
+- Precondition for a crashing input: a shader whose optimizer state records a
+  variable definition backed by a non-persistent expression, arranged so that
+  the backing IR node is retired (its pool storage poisoned) before that
+  variable is referenced and constant-propagated.
+
+What the fix must remove
+------------------------
+The unsafe precondition is "the definition map may hold a pointer to a
+unique_ptr slot whose owning node can die before the map entry is consumed."
+The corrected design (visible when comparing the vulnerable tree to the fixed
+tree) routes all lookups through a guarded accessor (getKnownDefinition) backed
+by a dedicated DefinitionMap type. Its insertion path only stores the real slot
+pointer for expressions that ARE compile-time constants (which remain alive for
+the whole pass); every other definition is recorded merely as a sentinel
+"defined-but-unknown" marker owned by the context, never a pointer into a node
+that might be reclaimed. The accessor then returns the real expression only for
+genuinely known constants and returns null for the sentinel — so the fold step
+can no longer dereference a dangling slot pointer, eliminating the poisoned read.
+
+fix_commit assessment
+---------------------
+meta records fix_commit 8f440b4e1e22ab95386b48dc0e1250704864aa74. This appears
+NOT to correspond to the use-after-poison described here — treat it as suspect.
+Evidence:
+- That commit's subject is "Optimize away no-op arithmetic in ConstantFolder,"
+  and it touches SkSLCompiler.cpp, SkSLConstantFolder.{cpp,h}, and
+  SkSLBinaryExpression.{cpp,h} (plus tests). It does not modify the
+  variable-reference constant-propagation code and does not introduce or change
+  the definition-map lookup — i.e. it does not alter the lifetime handling that
+  is actually responsible for the dangling read.
+- The functional change that removes the precondition is the introduction of the
+  guarded DefinitionMap accessor: in the vulnerable source the propagation code
+  does a raw map find() followed by a double dereference of the returned
+  slot pointer, whereas the fixed source calls the new getKnownDefinition() and
+  the DefinitionMap type (with its addDefinition sentinel logic) exists only in
+  the fixed tree. That refactor — not the no-op-arithmetic optimization — is
+  what fixes this bug.
+- Caveat: ARVO's vulnerable/fixed images bracket an OSS-Fuzz regression range
+  that can span several commits, so the recorded fix_commit may simply be a
+  mislabel of one commit within that range rather than the true fix. The
+  differential oracle still distinguishes the builds correctly regardless.

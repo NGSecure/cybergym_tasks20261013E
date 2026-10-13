@@ -1,0 +1,41 @@
+HarfBuzz's font-subsetter (hb-subset-fuzzer, driving hb_subset()) crashes with an
+UndefinedBehaviorSanitizer-reported SEGV/write fault while computing which glyphs a
+font's substitution rules can reach ("closure" computation over GSUB lookups) for a
+GSUB-only OpenType font.
+
+To avoid re-visiting the same lookup with the same set of active glyphs more than once,
+the closure walker keeps, per lookup index, a small memoization record: the glyph-set
+population it last saw for that lookup, and a set of glyphs already covered for it. When
+a lookup is revisited with a different active-glyph population than last time, that
+per-lookup covered-glyph set has to be reset for the new pass: if no such set exists yet
+for this lookup, one is (supposed to be) freshly allocated; either way the code then
+unconditionally clears whatever object comes back from looking the entry up again. That
+unconditional clear does not distinguish "a set object I just freshly created for this
+lookup" from "whatever handle the lookup returned right after creation" — the two are
+conflated into a single code path with no check that the object being cleared is really
+a distinct, owned, freshly allocated set safe to mutate in place. Clearing a set calls
+into its internal storage-vector resize logic, and for certain crafted GSUB tables that
+drive the closure walker to hit this exact freshly-created/first-seen case, the object
+handed back and cleared is not a normal owned allocation, so the resize inside clear()
+writes through a pointer/into a region it should not be writing into, producing the
+UBSan-reported invalid write and process abort.
+
+The crash only shows up when the GSUB closure walker's lookup-recursion machinery
+actually exercises the "first time this lookup's covered-glyph set needs to be
+created/reset" path with a specific active-glyph population — i.e. it needs contextual
+substitution or similar recursive lookup structures inside GSUB that get closure-visited
+via subsetting's glyph-retention pass (hb_subset() -> populating which glyph IDs to
+retain by closing over GSUB/GPOS lookups), not just any GSUB table. The reference PoC is
+a minimal TrueType font containing only a GSUB table, sized to trigger this recursive
+closure path deterministically and repeatably.
+
+fix_commit plausibility: the fix restructures the per-lookup memoization update in the
+closure-context helper into an explicit if/else — the branch that creates the per-lookup
+set for the first time is no longer followed by an unconditional clear of whatever the
+lookup returns; only the branch that finds an already-existing, previously-populated
+per-lookup set now clears it. This removes exactly the code path described above (clear
+immediately following creation, with no guarantee the two are looking at the same freshly
+owned object), and the surrounding project metadata (OSS-Fuzz's automated report links
+this same commit as the fix, and the tracking bot separately confirmed the reproducer
+verified-fixed once it landed) corroborates that this commit is the correct, targeted fix
+for this crash, not an unrelated or coincidental adjacent change.

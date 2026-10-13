@@ -1,0 +1,99 @@
+GraphicsMagick MSL coder: heap-use-after-free when writing an image through the MSL script processor
+
+Summary
+-------
+A heap-use-after-free (a 4-byte READ) occurs in the GraphicsMagick MSL
+(Magick Scripting Language) coder while an image is being *written* through the
+MSL format. The single script-processing routine that backs both the MSL reader
+and the MSL writer takes ownership of, and later frees, an Image object that it
+does not own -- the very image handed to it by the writer -- and then, on the
+way out, dereferences that already-freed object to compare exception
+severities. The read touches a 4-byte field (an exception-severity enum) located
+near the end of the freed Image structure (offset 6664 inside a 6864-byte
+region, exactly the size of one Image), which matches a read of that image's
+embedded exception record.
+
+Where the memory comes from and how it dies
+-------------------------------------------
+Both the reader and the writer of the MSL coder funnel into one shared
+script-processing routine. This routine keeps a small stack of working images in
+an MSLInfo structure (parallel arrays image[]/attributes[]/draw_info[]/
+image_info[], indexed by a counter n).
+
+- Allocation: during the earlier MSL *read*, the routine allocates a fresh
+  Image (via AllocateImage) that becomes the image object returned to the
+  caller. This is the object that ASAN's "previously allocated" stack points to.
+
+- The writer's re-entry: when that image is then written back out as MSL, the
+  writer entry point (WriteMSLImage) calls the same script-processing routine,
+  passing a pointer to the writer's Image *and* passing that image's own
+  embedded exception record as the routine's `exception` argument. Early in the
+  routine, because the incoming image pointer is non-NULL, the writer's image is
+  pushed onto the working stack via MSLPushImage, i.e. it is stored into
+  image[n] (n >= 1). Crucially, the routine records no distinction between
+  "images I allocated myself and must free" and "the image the writer merely
+  lent me."
+
+- The free: at the routine's cleanup/exit block (the "msl_info_error" path),
+  when no XML group is open (nGroups == 0), a loop walks the stack from n down to
+  1 and calls DestroyImage on every image[n] entry -- unconditionally. That loop
+  therefore frees the writer's borrowed image (the one at index 1), releasing
+  the 6864-byte Image region through MagickFree.
+
+- The use: immediately after the array-teardown, the routine still holds the
+  caller's `image` pointer (which was never reset in the write path, since it was
+  non-NULL on entry). The trailing "propagate the worst exception back to the
+  caller" check reads `(*image)->exception.severity` to compare it against the
+  outgoing exception. Because *image is exactly the object the cleanup loop just
+  freed, this comparison reads freed heap -- the reported use-after-free. Note
+  the `exception` argument itself also aliased a field inside that same
+  now-freed image, so the whole tail-end exception bookkeeping is operating on
+  released memory.
+
+Direction of the defect
+-----------------------
+This is a temporal error, not a spatial one: no buffer grew or shrank, no
+bounds check was bypassed by a degenerate value. A live pointer (the writer's
+Image, aliased by *image) is *freed* by an ownership mistake and then *read*
+(a 4-byte load of the exception-severity field). The failing access is a READ,
+and the dangling pointer is the caller-supplied image pointer that the routine
+wrongly treated as its own to destroy.
+
+Trigger precondition
+--------------------
+The defect is reached on the MSL *write* path for essentially any image the
+writer hands in: the incoming image is unconditionally pushed onto the working
+stack, and the exit-time teardown then destroys everything on that stack,
+including that borrowed image, before the routine dereferences it. The fuzz
+harness reaches it by first reading a blob through the MSL reader (producing an
+Image) and then writing that Image back out through the MSL writer.
+
+Fix assessment
+--------------
+The recorded fix commit (948d0f07874d1437f4369c0e82389b4286b21d98) corresponds
+directly to this defect; it edits exactly the shared script-processing routine
+described above. (The bundled patch.diff in the materials could not be used --
+it was captured as an anti-bot HTML challenge page rather than a real diff -- so
+this assessment is based on a direct source comparison of the vulnerable and
+fixed coders/msl.c trees from the two image tarballs.)
+
+The fix eliminates the mistaken-ownership precondition in three coordinated
+ways:
+1. It captures the writer-supplied image up front into a dedicated local
+   `writer_image = *image` and adds an explicit code comment that an image
+   passed in "is from the writer and should never be freed."
+2. In the array-teardown loop it guards the destroy with
+   `if (writer_image != msl_info.image[msl_info.n])`, so the borrowed writer
+   image is skipped and never released by the loop. This removes the free that
+   created the dangling pointer.
+3. It deletes the fragile trailing `(*image)->exception.severity` dereference
+   entirely. Exception propagation is now done *before* each image is destroyed
+   (copying from the still-live per-image exception, and separately from the
+   MSL file image `msl_image`), so no comparison ever reads a freed Image. The
+   read path is also cleaned up so *image is assigned msl_image only when acting
+   as a reader.
+
+Together, condition (2) removes the erroneous free of the writer's image and
+condition (3) removes the post-free read, so both halves of the
+use-after-free are severed. The fix commit is therefore a genuine and precise
+match for the root cause.
